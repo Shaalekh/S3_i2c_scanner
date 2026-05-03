@@ -25,34 +25,6 @@ typedef struct {
 
 static uint8_t s_framebuffer[OLED_WIDTH * OLED_PAGES];
 
-typedef struct {
-	char ch;
-	uint8_t rows[7];
-} glyph_t;
-
-static const glyph_t s_font[] = {
-	{' ', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-	{'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
-	{'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
-	{'a', {0x00, 0x0E, 0x01, 0x0F, 0x11, 0x11, 0x0F}},
-	{'e', {0x00, 0x0E, 0x11, 0x1F, 0x10, 0x11, 0x0E}},
-	{'h', {0x10, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x11}},
-	{'k', {0x10, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
-	{'l', {0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
-	{'m', {0x00, 0x1A, 0x15, 0x15, 0x15, 0x15, 0x15}},
-	{'r', {0x00, 0x16, 0x19, 0x10, 0x10, 0x10, 0x10}},
-};
-
-static const glyph_t *find_glyph(char ch)
-{
-	for (size_t i = 0; i < sizeof(s_font) / sizeof(s_font[0]); i++) {
-		if (s_font[i].ch == ch) {
-			return &s_font[i];
-		}
-	}
-	return &s_font[0];
-}
-
 static void set_pixel(uint8_t *buf, int x, int y, bool on)
 {
 	if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) {
@@ -67,25 +39,25 @@ static void set_pixel(uint8_t *buf, int x, int y, bool on)
 	}
 }
 
-static void draw_char(uint8_t *buf, int x, int y, char ch)
+static void draw_loading_bar(uint8_t *buf, int frame)
 {
-	const glyph_t *glyph = find_glyph(ch);
-	for (int row = 0; row < 7; row++) {
-		uint8_t row_bits = glyph->rows[row];
-		for (int col = 0; col < 5; col++) {
-			bool on = (row_bits & (1 << (4 - col))) != 0;
-			set_pixel(buf, x + col, y + row, on);
-		}
-	}
-}
+	const int bar_width = 12;
+	const int bar_height = 4;
+	const int max_x = OLED_WIDTH - bar_width;
+	const int cycle = max_x * 2;
+	int pos = cycle > 0 ? (frame % cycle) : 0;
 
-static void draw_text(uint8_t *buf, int x, int y, const char *text)
-{
-	int cursor_x = x;
-	while (*text != '\0') {
-		draw_char(buf, cursor_x, y, *text);
-		cursor_x += 6;
-		text++;
+	if (pos > max_x) {
+		pos = cycle - pos;
+	}
+
+	int x = pos;
+	int y = (OLED_HEIGHT - bar_height) / 2;
+
+	for (int dy = 0; dy < bar_height; dy++) {
+		for (int dx = 0; dx < bar_width; dx++) {
+			set_pixel(buf, x + dx, y + dy, true);
+		}
 	}
 }
 
@@ -173,14 +145,13 @@ void app_main(void)
 
 	oled_init_display(&oled_i2c);
 
-	memset(s_framebuffer, 0x00, sizeof(s_framebuffer));
-	draw_text(s_framebuffer, 0, 1, "Aalekh");
-	draw_text(s_framebuffer, 0, 12, "Sharma");
-	oled_show(&oled_i2c, s_framebuffer);
+	ESP_LOGI(TAG, "OLED animation running");
 
-	ESP_LOGI(TAG, "OLED update done");
-
+	int frame = 0;
 	while (true) {
-		vTaskDelay(pdMS_TO_TICKS(1000));
+		memset(s_framebuffer, 0x00, sizeof(s_framebuffer));
+		draw_loading_bar(s_framebuffer, frame++);
+		oled_show(&oled_i2c, s_framebuffer);
+		vTaskDelay(pdMS_TO_TICKS(60));
 	}
 }
