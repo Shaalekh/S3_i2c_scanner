@@ -31,6 +31,7 @@
 #define DS18B20_CMD_READ_SCRATCHPAD 0xBE
 #define DS18B20_SCRATCHPAD_SIZE 9
 #define DS18B20_CONV_TIME_MS 750
+#define DEBUG_LOG_INTERVAL_LOOPS 8
 
 static const char *TAG_OLED = "oled";
 static const char *TAG_TEMP = "temp";
@@ -341,6 +342,26 @@ static void format_temp_line(char *out, size_t len, char label, float value, boo
 	}
 }
 
+static void ads1115_debug_dump(void)
+{
+	if (!i2c_lock(pdMS_TO_TICKS(200))) {
+		ESP_LOGW(TAG_I2C, "I2C mutex timeout (ADS1115 debug)");
+		return;
+	}
+
+	for (uint8_t ch = 0; ch < 4; ch++) {
+		int16_t raw = 0;
+		esp_err_t err = ads1115_read_single_shot(s_ads.dev, ch, &raw);
+		if (err == ESP_OK) {
+			ESP_LOGI(TAG_I2C, "ADS1115 CH%u raw=%d", (unsigned)ch, (int)raw);
+		} else {
+			ESP_LOGW(TAG_I2C, "ADS1115 CH%u read failed: %s", (unsigned)ch, esp_err_to_name(err));
+		}
+	}
+
+	i2c_unlock();
+}
+
 static void oled_task(void *arg)
 {
 	(void)arg;
@@ -381,10 +402,15 @@ static void temp_task(void *arg)
 {
 	(void)arg;
 	TickType_t last_wake = xTaskGetTickCount();
+	int log_counter = 0;
+	int fail_counter = 0;
 
 	while (true) {
 		bool ok = ds18b20_start_conversion();
 		if (!ok) {
+			if ((++fail_counter % DEBUG_LOG_INTERVAL_LOOPS) == 0) {
+				ESP_LOGW(TAG_TEMP, "DS18B20 not responding");
+			}
 			if (xSemaphoreTake(s_temp_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
 				s_temp_state.valid = false;
 				xSemaphoreGive(s_temp_mutex);
@@ -402,6 +428,11 @@ static void temp_task(void *arg)
 				s_temp_state.temp_c = temp_c;
 				s_temp_state.temp_f = (temp_c * 9.0f / 5.0f) + 32.0f;
 				s_temp_state.valid = true;
+				if ((log_counter++ % DEBUG_LOG_INTERVAL_LOOPS) == 0) {
+					ESP_LOGI(TAG_TEMP, "DS18B20: %.2f C / %.2f F", (double)s_temp_state.temp_c,
+							(double)s_temp_state.temp_f);
+				}
+				fail_counter = 0;
 			} else {
 				s_temp_state.valid = false;
 			}
@@ -435,6 +466,10 @@ void app_main(void)
 	};
 	ESP_ERROR_CHECK(gpio_config(&ds18b20_gpio));
 	ds18b20_release_bus();
+	vTaskDelay(pdMS_TO_TICKS(5));
+	ESP_LOGI(TAG_TEMP, "DS18B20 bus idle level=%d", gpio_get_level(DS18B20_GPIO));
+	bool presence = ds18b20_reset_pulse();
+	ESP_LOGI(TAG_TEMP, "DS18B20 presence=%s", presence ? "yes" : "no");
 
 	i2c_master_bus_config_t bus_config = {
 		.clk_source = I2C_CLK_SRC_DEFAULT,
@@ -444,6 +479,7 @@ void app_main(void)
 		.glitch_ignore_cnt = 7,
 		.flags.enable_internal_pullup = true,
 	};
+	ESP_LOGI(TAG_I2C, "I2C init SDA=%d SCL=%d Freq=%d", I2C_SDA_GPIO, I2C_SCL_GPIO, I2C_FREQ_HZ);
 	ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &s_i2c_bus));
 	s_oled.bus = s_i2c_bus;
 
@@ -468,6 +504,7 @@ void app_main(void)
 	if (data_logger_init() != ESP_OK) {
 		ESP_LOGW(TAG_I2C, "Data logger (SPIFFS) init failed");
 	}
+	ads1115_debug_dump();
 
 	if (i2c_lock(pdMS_TO_TICKS(200))) {
 		esp_err_t err = oled_init_display(&s_oled);
