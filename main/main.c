@@ -1,6 +1,8 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
+#include <dirent.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -9,8 +11,18 @@
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_err.h"
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "esp_http_server.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "lwip/ip4_addr.h"
+
+#include "u8g2.h"
+
 #include "ads1115.h"
 #include "data_logger.h"
 
@@ -21,25 +33,39 @@
 #define OLED_I2C_ADDR 0x3C
 #define ADS1115_I2C_ADDR 0x48
 #define DS18B20_GPIO 10
+#define NAV_BUTTON_GPIO 13
+#define SELECT_BUTTON_GPIO 14
 
 #define OLED_WIDTH 64
 #define OLED_HEIGHT 32
-#define OLED_PAGES (OLED_HEIGHT / 8)
 
 #define DS18B20_CMD_SKIP_ROM 0xCC
 #define DS18B20_CMD_CONVERT_T 0x44
 #define DS18B20_CMD_READ_SCRATCHPAD 0xBE
 #define DS18B20_SCRATCHPAD_SIZE 9
 #define DS18B20_CONV_TIME_MS 750
-#define DEBUG_LOG_INTERVAL_LOOPS 8
 
-static const char *TAG_OLED = "oled";
+#define BOOT_SPLASH_MS 2000
+#define UI_REFRESH_MS 50
+#define HEARTLINE_BASE_Y 24
+#define HEARTLINE_HEIGHT 6
+
+#define ADS1115_FS_V 4.096f
+#define ADS1115_LSB (ADS1115_FS_V / 32768.0f)
+#define ADS_AVG_SAMPLES 4
+#define ACQ_SAMPLE_PERIOD_MS 50
+
+#define WIFI_AP_SSID "PhysoKit"
+#define WIFI_AP_PASS "Fit@2026"
+#define WIFI_MAX_CONN 4
+
+#define U8X8_I2C_BUFFER_SIZE 512
+
+static const char *TAG_UI = "ui";
 static const char *TAG_TEMP = "temp";
 static const char *TAG_I2C = "i2c";
-
-static i2c_master_bus_handle_t s_i2c_bus;
-static SemaphoreHandle_t s_i2c_mutex;
-static SemaphoreHandle_t s_temp_mutex;
+static const char *TAG_WIFI = "wifi";
+static const char *TAG_HTTP = "http";
 
 typedef struct {
 	i2c_master_bus_handle_t bus;
@@ -50,18 +76,45 @@ typedef struct {
 	i2c_master_dev_handle_t dev;
 } ads1115_t;
 
-static oled_i2c_t s_oled;
-static ads1115_t s_ads;
-
-static uint8_t s_framebuffer[OLED_WIDTH * OLED_PAGES];
-
 typedef struct {
 	float temp_c;
-	float temp_f;
 	bool valid;
 } temp_state_t;
 
+typedef enum {
+	UI_STATE_BOOT = 0,
+	UI_STATE_MENU_ACQ,
+	UI_STATE_MENU_WEB,
+	UI_STATE_ACQ_RUNNING,
+	UI_STATE_WEB_RUNNING,
+	UI_STATE_SAVE_NOTICE,
+} ui_state_t;
+
+static i2c_master_bus_handle_t s_i2c_bus;
+static oled_i2c_t s_oled;
+static ads1115_t s_ads;
+static SemaphoreHandle_t s_i2c_mutex;
+static SemaphoreHandle_t s_temp_mutex;
+static SemaphoreHandle_t s_acq_mutex;
+
+static u8g2_t s_u8g2;
+static uint8_t s_u8x8_buffer[U8X8_I2C_BUFFER_SIZE];
+static size_t s_u8x8_buf_len;
+
 static temp_state_t s_temp_state;
+static volatile bool s_acq_running;
+static uint64_t s_acq_start_ms;
+static uint64_t s_save_notice_until_ms;
+static FILE *s_log_file;
+static char s_log_path[64];
+static char s_saved_name[32];
+static ui_state_t s_ui_state = UI_STATE_BOOT;
+static int s_heart_phase;
+
+static bool s_wifi_running;
+static esp_netif_t *s_netif_ap;
+static httpd_handle_t s_http;
+static char s_ap_ip[16];
 
 static bool i2c_lock(TickType_t timeout_ticks)
 {
@@ -73,138 +126,438 @@ static void i2c_unlock(void)
 	xSemaphoreGive(s_i2c_mutex);
 }
 
-static void set_pixel(uint8_t *buf, int x, int y, bool on)
+static uint8_t u8x8_byte_esp32_i2c(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
 {
-	if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) {
+	(void)u8x8;
+	switch (msg) {
+	case U8X8_MSG_BYTE_INIT:
+		return 1;
+	case U8X8_MSG_BYTE_START_TRANSFER:
+		s_u8x8_buf_len = 0;
+		return 1;
+	case U8X8_MSG_BYTE_SEND:
+		if (s_u8x8_buf_len + arg_int > sizeof(s_u8x8_buffer)) {
+			return 0;
+		}
+		memcpy(&s_u8x8_buffer[s_u8x8_buf_len], arg_ptr, arg_int);
+		s_u8x8_buf_len += arg_int;
+		return 1;
+	case U8X8_MSG_BYTE_END_TRANSFER: {
+		esp_err_t err;
+		if (!i2c_lock(pdMS_TO_TICKS(100))) {
+			return 0;
+		}
+		err = i2c_master_transmit(s_oled.dev, s_u8x8_buffer, s_u8x8_buf_len, -1);
+		i2c_unlock();
+		return err == ESP_OK;
+	}
+	default:
+		return 0;
+	}
+}
+
+static uint8_t u8x8_gpio_and_delay_esp32(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
+{
+	(void)u8x8;
+	(void)arg_ptr;
+	switch (msg) {
+	case U8X8_MSG_DELAY_MILLI:
+		vTaskDelay(pdMS_TO_TICKS(arg_int));
+		break;
+	case U8X8_MSG_DELAY_10MICRO:
+		esp_rom_delay_us((uint32_t)arg_int * 10U);
+		break;
+	case U8X8_MSG_DELAY_100NANO:
+		esp_rom_delay_us(1);
+		break;
+	default:
+		break;
+	}
+	return 1;
+}
+
+static void ui_draw_centered(const char *line1, const char *line2)
+{
+	int y1 = 12;
+	int y2 = 26;
+	int w1 = u8g2_GetStrWidth(&s_u8g2, line1);
+	int x1 = (OLED_WIDTH - w1) / 2;
+	if (x1 < 0) {
+		x1 = 0;
+	}
+	u8g2_DrawStr(&s_u8g2, x1, y1, line1);
+	if (line2 != NULL) {
+		int w2 = u8g2_GetStrWidth(&s_u8g2, line2);
+		int x2 = (OLED_WIDTH - w2) / 2;
+		if (x2 < 0) {
+			x2 = 0;
+		}
+		u8g2_DrawStr(&s_u8g2, x2, y2, line2);
+	}
+}
+
+static void ui_draw_heartline(int phase)
+{
+	int x = phase % OLED_WIDTH;
+	u8g2_DrawHLine(&s_u8g2, 0, HEARTLINE_BASE_Y, OLED_WIDTH);
+	u8g2_DrawVLine(&s_u8g2, x, HEARTLINE_BASE_Y - HEARTLINE_HEIGHT, HEARTLINE_HEIGHT);
+}
+
+static void ui_show_boot_splash(void)
+{
+	u8g2_ClearBuffer(&s_u8g2);
+	ui_draw_centered("Booting Up", NULL);
+	u8g2_SendBuffer(&s_u8g2);
+	vTaskDelay(pdMS_TO_TICKS(BOOT_SPLASH_MS));
+}
+
+static bool button_pressed(gpio_num_t gpio)
+{
+	return gpio_get_level(gpio) == 0;
+}
+
+static const char *basename_ptr(const char *path)
+{
+	const char *slash = strrchr(path, '/');
+	return slash ? slash + 1 : path;
+}
+
+static bool ads1115_read_channel_avg(uint8_t ch, float *out_v)
+{
+	int32_t sum = 0;
+	for (int i = 0; i < ADS_AVG_SAMPLES; i++) {
+		int16_t raw = 0;
+		if (!i2c_lock(pdMS_TO_TICKS(100))) {
+			return false;
+		}
+		esp_err_t err = ads1115_read_single_shot(s_ads.dev, ch, &raw);
+		i2c_unlock();
+		if (err != ESP_OK) {
+			return false;
+		}
+		sum += raw;
+		vTaskDelay(pdMS_TO_TICKS(1));
+	}
+	*out_v = ((float)sum / (float)ADS_AVG_SAMPLES) * ADS1115_LSB;
+	return true;
+}
+
+static bool start_acquisition(void)
+{
+	char path[64];
+	FILE *f = data_logger_create_unique_file(path, sizeof(path));
+	if (f == NULL) {
+		ESP_LOGW(TAG_UI, "Failed to create CSV file");
+		return false;
+	}
+	if (xSemaphoreTake(s_acq_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+		s_log_file = f;
+		strncpy(s_log_path, path, sizeof(s_log_path) - 1);
+		s_log_path[sizeof(s_log_path) - 1] = '\0';
+		xSemaphoreGive(s_acq_mutex);
+	}
+	s_acq_start_ms = (uint64_t)(esp_timer_get_time() / 1000);
+	s_acq_running = true;
+	ESP_LOGI(TAG_UI, "Acquisition started: %s", s_log_path);
+	return true;
+}
+
+static void stop_acquisition(void)
+{
+	s_acq_running = false;
+	if (xSemaphoreTake(s_acq_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+		if (s_log_file != NULL) {
+			fclose(s_log_file);
+			s_log_file = NULL;
+		}
+		xSemaphoreGive(s_acq_mutex);
+	}
+	const char *base = basename_ptr(s_log_path);
+	snprintf(s_saved_name, sizeof(s_saved_name), "%s", base);
+	s_save_notice_until_ms = (uint64_t)(esp_timer_get_time() / 1000) + 3000;
+	ESP_LOGI(TAG_UI, "Acquisition stopped, saved %s", s_saved_name);
+}
+
+static esp_err_t http_root_get_handler(httpd_req_t *req)
+{
+	httpd_resp_set_type(req, "text/html");
+	httpd_resp_sendstr_chunk(req, "<html><head><title>PhysoKit Files</title></head><body>");
+	httpd_resp_sendstr_chunk(req, "<h3>CSV Files</h3><ul>");
+
+	DIR *dir = opendir("/spiffs");
+	if (dir != NULL) {
+		struct dirent *ent;
+		while ((ent = readdir(dir)) != NULL) {
+			if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+				continue;
+			}
+			httpd_resp_sendstr_chunk(req, "<li><a href=\"/download?name=");
+			httpd_resp_sendstr_chunk(req, ent->d_name);
+			httpd_resp_sendstr_chunk(req, "\">");
+			httpd_resp_sendstr_chunk(req, ent->d_name);
+			httpd_resp_sendstr_chunk(req, "</a></li>");
+		}
+		closedir(dir);
+	}
+
+	httpd_resp_sendstr_chunk(req, "</ul></body></html>");
+	httpd_resp_send_chunk(req, NULL, 0);
+	return ESP_OK;
+}
+
+static esp_err_t http_download_get_handler(httpd_req_t *req)
+{
+	char query[64];
+	char name[32];
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing query");
+		return ESP_FAIL;
+	}
+	if (httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK) {
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing name");
+		return ESP_FAIL;
+	}
+	if (strstr(name, "..") != NULL || strchr(name, '/') != NULL) {
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid name");
+		return ESP_FAIL;
+	}
+
+	char path[64];
+	snprintf(path, sizeof(path), "/spiffs/%s", name);
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+		return ESP_FAIL;
+	}
+
+	httpd_resp_set_type(req, "text/csv");
+	httpd_resp_set_hdr(req, "Content-Disposition", "attachment");
+
+	char buf[256];
+	size_t read_bytes;
+	while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
+		if (httpd_resp_send_chunk(req, buf, read_bytes) != ESP_OK) {
+			fclose(f);
+			httpd_resp_sendstr_chunk(req, NULL);
+			return ESP_FAIL;
+		}
+	}
+	fclose(f);
+	httpd_resp_send_chunk(req, NULL, 0);
+	return ESP_OK;
+}
+
+static esp_err_t http_server_start(void)
+{
+	if (s_http != NULL) {
+		return ESP_OK;
+	}
+	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+	config.uri_match_fn = httpd_uri_match_wildcard;
+	ESP_LOGI(TAG_HTTP, "Starting HTTP server");
+	if (httpd_start(&s_http, &config) != ESP_OK) {
+		ESP_LOGW(TAG_HTTP, "Failed to start HTTP server");
+		s_http = NULL;
+		return ESP_FAIL;
+	}
+
+	static const httpd_uri_t root_uri = {
+		.uri = "/",
+		.method = HTTP_GET,
+		.handler = http_root_get_handler,
+		.user_ctx = NULL,
+	};
+	static const httpd_uri_t download_uri = {
+		.uri = "/download",
+		.method = HTTP_GET,
+		.handler = http_download_get_handler,
+		.user_ctx = NULL,
+	};
+	httpd_register_uri_handler(s_http, &root_uri);
+	httpd_register_uri_handler(s_http, &download_uri);
+	return ESP_OK;
+}
+
+static void http_server_stop(void)
+{
+	if (s_http != NULL) {
+		httpd_stop(s_http);
+		s_http = NULL;
+	}
+}
+
+static esp_err_t wifi_ap_start(void)
+{
+	if (s_wifi_running) {
+		return ESP_OK;
+	}
+	if (s_netif_ap == NULL) {
+		s_netif_ap = esp_netif_create_default_wifi_ap();
+	}
+
+	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+
+	wifi_config_t ap_config = {0};
+	strncpy((char *)ap_config.ap.ssid, WIFI_AP_SSID, sizeof(ap_config.ap.ssid) - 1);
+	strncpy((char *)ap_config.ap.password, WIFI_AP_PASS, sizeof(ap_config.ap.password) - 1);
+	ap_config.ap.ssid_len = strlen(WIFI_AP_SSID);
+	ap_config.ap.channel = 1;
+	ap_config.ap.max_connection = WIFI_MAX_CONN;
+	if (strlen(WIFI_AP_PASS) < 8) {
+		ap_config.ap.authmode = WIFI_AUTH_OPEN;
+	} else {
+		ap_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+	}
+	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+	ESP_ERROR_CHECK(esp_wifi_start());
+
+	esp_netif_ip_info_t ip;
+	if (s_netif_ap != NULL && esp_netif_get_ip_info(s_netif_ap, &ip) == ESP_OK) {
+		ip4addr_ntoa_r((const ip4_addr_t *)&ip.ip, s_ap_ip, sizeof(s_ap_ip));
+	} else {
+		snprintf(s_ap_ip, sizeof(s_ap_ip), "0.0.0.0");
+	}
+
+	s_wifi_running = true;
+	ESP_LOGI(TAG_WIFI, "AP started, IP=%s", s_ap_ip);
+	return ESP_OK;
+}
+
+static void wifi_ap_stop(void)
+{
+	if (!s_wifi_running) {
 		return;
 	}
-	size_t index = (y / 8) * OLED_WIDTH + x;
-	uint8_t mask = 1 << (y % 8);
-	if (on) {
-		buf[index] |= mask;
-	} else {
-		buf[index] &= (uint8_t)~mask;
+	http_server_stop();
+	ESP_ERROR_CHECK(esp_wifi_stop());
+	ESP_ERROR_CHECK(esp_wifi_deinit());
+	if (s_netif_ap != NULL) {
+		esp_netif_destroy(s_netif_ap);
+		s_netif_ap = NULL;
 	}
+	s_wifi_running = false;
+	ESP_LOGI(TAG_WIFI, "AP stopped");
 }
 
-typedef struct {
-	char ch;
-	uint8_t rows[7];
-} glyph_t;
-
-static const glyph_t s_font[] = {
-	{' ', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-	{'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06}},
-	{'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
-	{':', {0x00, 0x06, 0x06, 0x00, 0x06, 0x06, 0x00}},
-	{'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}},
-	{'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
-	{'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}},
-	{'3', {0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E}},
-	{'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}},
-	{'5', {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E}},
-	{'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}},
-	{'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
-	{'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}},
-	{'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
-	{'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
-	{'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
-};
-
-static const glyph_t *find_glyph(char ch)
+static void ui_task(void *arg)
 {
-	for (size_t i = 0; i < sizeof(s_font) / sizeof(s_font[0]); i++) {
-		if (s_font[i].ch == ch) {
-			return &s_font[i];
+	(void)arg;
+	bool nav_prev = false;
+	bool sel_prev = false;
+
+	s_ui_state = UI_STATE_MENU_ACQ;
+
+	while (true) {
+		bool nav = button_pressed(NAV_BUTTON_GPIO);
+		bool sel = button_pressed(SELECT_BUTTON_GPIO);
+
+		if (nav && !nav_prev) {
+			if (s_ui_state == UI_STATE_MENU_ACQ) {
+				s_ui_state = UI_STATE_MENU_WEB;
+			} else if (s_ui_state == UI_STATE_MENU_WEB) {
+				s_ui_state = UI_STATE_MENU_ACQ;
+			}
 		}
-	}
-	return &s_font[0];
-}
 
-static void draw_char(uint8_t *buf, int x, int y, char ch)
-{
-	const glyph_t *glyph = find_glyph(ch);
-	for (int row = 0; row < 7; row++) {
-		uint8_t row_bits = glyph->rows[row];
-		for (int col = 0; col < 5; col++) {
-			bool on = (row_bits & (1 << (4 - col))) != 0;
-			set_pixel(buf, x + col, y + row, on);
+		if (sel && !sel_prev) {
+			if (s_ui_state == UI_STATE_MENU_ACQ) {
+				if (start_acquisition()) {
+					s_ui_state = UI_STATE_ACQ_RUNNING;
+				}
+			} else if (s_ui_state == UI_STATE_MENU_WEB) {
+				if (wifi_ap_start() == ESP_OK && http_server_start() == ESP_OK) {
+					s_ui_state = UI_STATE_WEB_RUNNING;
+				} else {
+					wifi_ap_stop();
+					ESP_LOGW(TAG_UI, "Failed to start web mode");
+				}
+			} else if (s_ui_state == UI_STATE_ACQ_RUNNING) {
+				stop_acquisition();
+				s_ui_state = UI_STATE_SAVE_NOTICE;
+			} else if (s_ui_state == UI_STATE_WEB_RUNNING) {
+				wifi_ap_stop();
+				s_ui_state = UI_STATE_MENU_WEB;
+			}
 		}
+
+		nav_prev = nav;
+		sel_prev = sel;
+
+		uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+		if (s_ui_state == UI_STATE_SAVE_NOTICE && now_ms >= s_save_notice_until_ms) {
+			s_ui_state = UI_STATE_MENU_ACQ;
+		}
+
+		u8g2_ClearBuffer(&s_u8g2);
+		switch (s_ui_state) {
+		case UI_STATE_MENU_ACQ:
+			ui_draw_centered("Acquisition", "mode");
+			break;
+		case UI_STATE_MENU_WEB:
+			ui_draw_centered("Web server", "mode");
+			break;
+		case UI_STATE_ACQ_RUNNING: {
+			uint64_t elapsed_s = (now_ms - s_acq_start_ms) / 1000;
+			unsigned int minutes = (unsigned int)((elapsed_s / 60) % 100);
+			unsigned int seconds = (unsigned int)(elapsed_s % 60);
+			char timer[12];
+			snprintf(timer, sizeof(timer), "%02u:%02u", minutes, seconds);
+			u8g2_DrawStr(&s_u8g2, 0, 10, timer);
+			ui_draw_heartline(s_heart_phase++);
+			break;
+		}
+		case UI_STATE_WEB_RUNNING:
+			u8g2_DrawStr(&s_u8g2, 0, 10, "IP addr:");
+			u8g2_DrawStr(&s_u8g2, 0, 24, s_ap_ip[0] ? s_ap_ip : "starting");
+			break;
+		case UI_STATE_SAVE_NOTICE:
+			ui_draw_centered("Saved as", s_saved_name);
+			break;
+		default:
+			break;
+		}
+		u8g2_SendBuffer(&s_u8g2);
+		vTaskDelay(pdMS_TO_TICKS(UI_REFRESH_MS));
 	}
 }
 
-static void draw_text(uint8_t *buf, int x, int y, const char *text)
+static void acq_task(void *arg)
 {
-	int cursor_x = x;
-	while (*text != '\0') {
-		draw_char(buf, cursor_x, y, *text);
-		cursor_x += 6;
-		text++;
+	(void)arg;
+	while (true) {
+		if (!s_acq_running) {
+			vTaskDelay(pdMS_TO_TICKS(50));
+			continue;
+		}
+
+		uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
+		float eeg = NAN;
+		float ecg = NAN;
+		float gsr = NAN;
+
+		(void)ads1115_read_channel_avg(0, &eeg);
+		(void)ads1115_read_channel_avg(1, &ecg);
+		(void)ads1115_read_channel_avg(2, &gsr);
+
+		float temp_c = NAN;
+		if (xSemaphoreTake(s_temp_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+			if (s_temp_state.valid) {
+				temp_c = s_temp_state.temp_c;
+			}
+			xSemaphoreGive(s_temp_mutex);
+		}
+
+		if (xSemaphoreTake(s_acq_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+			if (s_log_file != NULL) {
+				(void)data_logger_write_row(s_log_file, now_ms, eeg, ecg, gsr, temp_c);
+			}
+			xSemaphoreGive(s_acq_mutex);
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(ACQ_SAMPLE_PERIOD_MS));
 	}
-}
-
-static esp_err_t oled_write_cmd(oled_i2c_t *oled, uint8_t cmd)
-{
-	uint8_t data[2] = {0x00, cmd};
-	return i2c_master_transmit(oled->dev, data, sizeof(data), -1);
-}
-
-static esp_err_t oled_write_data(oled_i2c_t *oled, const uint8_t *data, size_t len)
-{
-	uint8_t payload[1 + OLED_WIDTH];
-	if (len > OLED_WIDTH) {
-		return ESP_ERR_INVALID_SIZE;
-	}
-	payload[0] = 0x40;
-	memcpy(&payload[1], data, len);
-	return i2c_master_transmit(oled->dev, payload, len + 1, -1);
-}
-
-static esp_err_t oled_init_display(oled_i2c_t *oled)
-{
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xAE), TAG_OLED, "display off failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x00), TAG_OLED, "set column low failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x12), TAG_OLED, "set column high failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x00), TAG_OLED, "set start line failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xB0), TAG_OLED, "set page addr failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x81), TAG_OLED, "contrast control failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x4F), TAG_OLED, "contrast value failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xA1), TAG_OLED, "segment remap failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xA6), TAG_OLED, "normal display failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xA8), TAG_OLED, "multiplex ratio failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x1F), TAG_OLED, "multiplex value failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xC8), TAG_OLED, "com scan dir failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xD3), TAG_OLED, "display offset failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x00), TAG_OLED, "display offset value failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x20), TAG_OLED, "addressing mode failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x01), TAG_OLED, "vertical addr mode failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xD5), TAG_OLED, "osc division failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x80), TAG_OLED, "osc division value failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xD9), TAG_OLED, "pre-charge period failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xF1), TAG_OLED, "pre-charge value failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xDA), TAG_OLED, "set com pins failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x12), TAG_OLED, "com pins value failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xDB), TAG_OLED, "vcomh set failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x40), TAG_OLED, "vcomh value failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x8D), TAG_OLED, "charge pump enable failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x14), TAG_OLED, "charge pump value failed");
-	ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0xAF), TAG_OLED, "display on failed");
-	return ESP_OK;
-}
-
-static esp_err_t oled_show(oled_i2c_t *oled, const uint8_t *buf)
-{
-	for (int page = 0; page < OLED_PAGES; page++) {
-		ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x22), TAG_OLED, "set page range failed");
-		ESP_RETURN_ON_ERROR(oled_write_cmd(oled, page), TAG_OLED, "set page start failed");
-		ESP_RETURN_ON_ERROR(oled_write_cmd(oled, page), TAG_OLED, "set page end failed");
-		ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x21), TAG_OLED, "set column range failed");
-		ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x20), TAG_OLED, "set column low failed");
-		ESP_RETURN_ON_ERROR(oled_write_cmd(oled, 0x5F), TAG_OLED, "set column high failed");
-		ESP_RETURN_ON_ERROR(oled_write_data(oled, &buf[page * OLED_WIDTH], OLED_WIDTH), TAG_OLED,
-				"write data failed");
-	}
-	return ESP_OK;
 }
 
 static void ds18b20_drive_low(void)
@@ -251,7 +604,6 @@ static void ds18b20_write_bit(bool bit)
 static bool ds18b20_read_bit(void)
 {
 	bool bit;
-	
 	ds18b20_drive_low();
 	esp_rom_delay_us(6);
 	ds18b20_release_bus();
@@ -282,7 +634,6 @@ static uint8_t ds18b20_read_byte(void)
 static uint8_t ds18b20_crc8(const uint8_t *data, size_t len)
 {
 	uint8_t crc = 0;
-
 	for (size_t i = 0; i < len; i++) {
 		uint8_t inbyte = data[i];
 		for (int bit = 0; bit < 8; bit++) {
@@ -294,7 +645,6 @@ static uint8_t ds18b20_crc8(const uint8_t *data, size_t len)
 			inbyte >>= 1;
 		}
 	}
-
 	return crc;
 }
 
@@ -327,114 +677,34 @@ static bool ds18b20_read_temperature(float *out_c)
 	if (!ds18b20_read_scratchpad(scratchpad)) {
 		return false;
 	}
-
 	int16_t raw = (int16_t)((scratchpad[1] << 8) | scratchpad[0]);
 	*out_c = (float)raw / 16.0f;
 	return true;
-}
-
-static void format_temp_line(char *out, size_t len, char label, float value, bool valid)
-{
-	if (valid) {
-		snprintf(out, len, "%c:%5.1f", label, (double)value);
-	} else {
-		snprintf(out, len, "%c: --.-", label);
-	}
-}
-
-static void ads1115_debug_dump(void)
-{
-	if (!i2c_lock(pdMS_TO_TICKS(200))) {
-		ESP_LOGW(TAG_I2C, "I2C mutex timeout (ADS1115 debug)");
-		return;
-	}
-
-	for (uint8_t ch = 0; ch < 4; ch++) {
-		int16_t raw = 0;
-		esp_err_t err = ads1115_read_single_shot(s_ads.dev, ch, &raw);
-		if (err == ESP_OK) {
-			ESP_LOGI(TAG_I2C, "ADS1115 CH%u raw=%d", (unsigned)ch, (int)raw);
-		} else {
-			ESP_LOGW(TAG_I2C, "ADS1115 CH%u read failed: %s", (unsigned)ch, esp_err_to_name(err));
-		}
-	}
-
-	i2c_unlock();
-}
-
-static void oled_task(void *arg)
-{
-	(void)arg;
-	char line_c[12];
-	char line_f[12];
-
-	ESP_LOGI(TAG_OLED, "OLED temperature display running");
-
-	while (true) {
-		temp_state_t snapshot = {.valid = false, .temp_c = 0.0f, .temp_f = 0.0f};
-		if (xSemaphoreTake(s_temp_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-			snapshot = s_temp_state;
-			xSemaphoreGive(s_temp_mutex);
-		}
-
-		format_temp_line(line_c, sizeof(line_c), 'C', snapshot.temp_c, snapshot.valid);
-		format_temp_line(line_f, sizeof(line_f), 'F', snapshot.temp_f, snapshot.valid);
-
-		memset(s_framebuffer, 0x00, sizeof(s_framebuffer));
-		draw_text(s_framebuffer, 0, 0, line_c);
-		draw_text(s_framebuffer, 0, 16, line_f);
-
-		if (i2c_lock(pdMS_TO_TICKS(100))) {
-			esp_err_t err = oled_show(&s_oled, s_framebuffer);
-			i2c_unlock();
-			if (err != ESP_OK) {
-				ESP_LOGW(TAG_OLED, "OLED update failed: %s", esp_err_to_name(err));
-			}
-		} else {
-			ESP_LOGW(TAG_I2C, "I2C mutex timeout (OLED)");
-		}
-
-		vTaskDelay(pdMS_TO_TICKS(250));
-	}
 }
 
 static void temp_task(void *arg)
 {
 	(void)arg;
 	TickType_t last_wake = xTaskGetTickCount();
-	int log_counter = 0;
-	int fail_counter = 0;
-
 	while (true) {
 		bool ok = ds18b20_start_conversion();
 		if (!ok) {
-			if ((++fail_counter % DEBUG_LOG_INTERVAL_LOOPS) == 0) {
-				ESP_LOGW(TAG_TEMP, "DS18B20 not responding");
-			}
 			if (xSemaphoreTake(s_temp_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
 				s_temp_state.valid = false;
 				xSemaphoreGive(s_temp_mutex);
 			}
+			ESP_LOGW(TAG_TEMP, "DS18B20 not responding");
 			vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(DS18B20_CONV_TIME_MS));
 			continue;
 		}
 
 		vTaskDelay(pdMS_TO_TICKS(DS18B20_CONV_TIME_MS));
-
 		float temp_c = 0.0f;
 		ok = ds18b20_read_temperature(&temp_c);
 		if (xSemaphoreTake(s_temp_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+			s_temp_state.valid = ok;
 			if (ok) {
 				s_temp_state.temp_c = temp_c;
-				s_temp_state.temp_f = (temp_c * 9.0f / 5.0f) + 32.0f;
-				s_temp_state.valid = true;
-				if ((log_counter++ % DEBUG_LOG_INTERVAL_LOOPS) == 0) {
-					ESP_LOGI(TAG_TEMP, "DS18B20: %.2f C / %.2f F", (double)s_temp_state.temp_c,
-							(double)s_temp_state.temp_f);
-				}
-				fail_counter = 0;
-			} else {
-				s_temp_state.valid = false;
 			}
 			xSemaphoreGive(s_temp_mutex);
 		}
@@ -457,6 +727,23 @@ void app_main(void)
 		return;
 	}
 
+	s_acq_mutex = xSemaphoreCreateMutex();
+	if (s_acq_mutex == NULL) {
+		ESP_LOGE(TAG_UI, "Failed to create acquisition mutex");
+		return;
+	}
+
+	esp_err_t err = nvs_flash_init();
+	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+		nvs_flash_erase();
+		ESP_ERROR_CHECK(nvs_flash_init());
+	}
+	ESP_ERROR_CHECK(esp_netif_init());
+	err = esp_event_loop_create_default();
+	if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+		ESP_ERROR_CHECK(err);
+	}
+
 	gpio_config_t ds18b20_gpio = {
 		.pin_bit_mask = 1ULL << DS18B20_GPIO,
 		.mode = GPIO_MODE_INPUT_OUTPUT_OD,
@@ -466,10 +753,17 @@ void app_main(void)
 	};
 	ESP_ERROR_CHECK(gpio_config(&ds18b20_gpio));
 	ds18b20_release_bus();
-	vTaskDelay(pdMS_TO_TICKS(5));
 	ESP_LOGI(TAG_TEMP, "DS18B20 bus idle level=%d", gpio_get_level(DS18B20_GPIO));
-	bool presence = ds18b20_reset_pulse();
-	ESP_LOGI(TAG_TEMP, "DS18B20 presence=%s", presence ? "yes" : "no");
+	ESP_LOGI(TAG_TEMP, "DS18B20 presence=%s", ds18b20_reset_pulse() ? "yes" : "no");
+
+	gpio_config_t button_gpio = {
+		.pin_bit_mask = (1ULL << NAV_BUTTON_GPIO) | (1ULL << SELECT_BUTTON_GPIO),
+		.mode = GPIO_MODE_INPUT,
+		.pull_up_en = GPIO_PULLUP_ENABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	ESP_ERROR_CHECK(gpio_config(&button_gpio));
 
 	i2c_master_bus_config_t bus_config = {
 		.clk_source = I2C_CLK_SRC_DEFAULT,
@@ -483,12 +777,12 @@ void app_main(void)
 	ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &s_i2c_bus));
 	s_oled.bus = s_i2c_bus;
 
-	i2c_device_config_t dev_config = {
+	i2c_device_config_t oled_config = {
 		.dev_addr_length = I2C_ADDR_BIT_LEN_7,
 		.device_address = OLED_I2C_ADDR,
 		.scl_speed_hz = I2C_FREQ_HZ,
 	};
-	ESP_ERROR_CHECK(i2c_master_bus_add_device(s_oled.bus, &dev_config, &s_oled.dev));
+	ESP_ERROR_CHECK(i2c_master_bus_add_device(s_oled.bus, &oled_config, &s_oled.dev));
 
 	i2c_device_config_t ads_config = {
 		.dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -497,26 +791,22 @@ void app_main(void)
 	};
 	ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &ads_config, &s_ads.dev));
 
-	// Initialize ADS1115 driver (no-op) and data logger (SPIFFS)
 	if (ads1115_init(s_ads.dev) != ESP_OK) {
 		ESP_LOGW(TAG_I2C, "ADS1115 init failed or returned error");
 	}
 	if (data_logger_init() != ESP_OK) {
-		ESP_LOGW(TAG_I2C, "Data logger (SPIFFS) init failed");
-	}
-	ads1115_debug_dump();
-
-	if (i2c_lock(pdMS_TO_TICKS(200))) {
-		esp_err_t err = oled_init_display(&s_oled);
-		if (err != ESP_OK) {
-			ESP_LOGE(TAG_OLED, "OLED init failed: %s", esp_err_to_name(err));
-		}
-		i2c_unlock();
-	} else {
-		ESP_LOGE(TAG_I2C, "I2C mutex timeout during init");
-		return;
+		ESP_LOGW(TAG_UI, "Data logger (SPIFFS) init failed");
 	}
 
-	xTaskCreate(oled_task, "oled_task", 4096, NULL, 5, NULL);
+	u8g2_Setup_ssd1306_i2c_64x32_noname_f(
+		&s_u8g2, U8G2_R0, u8x8_byte_esp32_i2c, u8x8_gpio_and_delay_esp32);
+	u8x8_SetI2CAddress(&s_u8g2.u8x8, OLED_I2C_ADDR << 1);
+	u8g2_InitDisplay(&s_u8g2);
+	u8g2_SetPowerSave(&s_u8g2, 0);
+	u8g2_SetFont(&s_u8g2, u8g2_font_5x7_tr);
+	ui_show_boot_splash();
+
+	xTaskCreate(ui_task, "ui_task", 4096, NULL, 5, NULL);
+	xTaskCreate(acq_task, "acq_task", 4096, NULL, 5, NULL);
 	xTaskCreate(temp_task, "temp_task", 4096, NULL, 5, NULL);
 }

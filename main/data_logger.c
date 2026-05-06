@@ -45,9 +45,9 @@ esp_err_t data_logger_deinit(void)
 
 FILE *data_logger_create_unique_file(char *out_name, size_t len)
 {
-    // Try data000.csv..data999.csv
-    for (int i = 0; i < 1000; i++) {
-        snprintf(out_name, len, "%s/data%03d.csv", MOUNT_PATH, i);
+    // Try data01.csv..data99.csv
+    for (int i = 1; i < 100; i++) {
+        snprintf(out_name, len, "%s/data%02d.csv", MOUNT_PATH, i);
         struct stat st;
         if (stat(out_name, &st) != 0) {
             // file does not exist -> create
