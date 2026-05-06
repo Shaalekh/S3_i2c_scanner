@@ -11,6 +11,8 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "ads1115.h"
+#include "data_logger.h"
 
 #define I2C_PORT I2C_NUM_0
 #define I2C_SDA_GPIO 8
@@ -458,6 +460,14 @@ void app_main(void)
 		.scl_speed_hz = I2C_FREQ_HZ,
 	};
 	ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &ads_config, &s_ads.dev));
+
+	// Initialize ADS1115 driver (no-op) and data logger (SPIFFS)
+	if (ads1115_init(s_ads.dev) != ESP_OK) {
+		ESP_LOGW(TAG_I2C, "ADS1115 init failed or returned error");
+	}
+	if (data_logger_init() != ESP_OK) {
+		ESP_LOGW(TAG_I2C, "Data logger (SPIFFS) init failed");
+	}
 
 	if (i2c_lock(pdMS_TO_TICKS(200))) {
 		esp_err_t err = oled_init_display(&s_oled);

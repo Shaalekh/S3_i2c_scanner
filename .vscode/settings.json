@@ -3,8 +3,8 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.port": "/dev/ttyACM0",
-  "idf.currentSetup": "/home/shaalekh/.espressif/v5.5.3/esp-idf",
+  "idf.port": "/dev/ttyACM1",
+  "idf.currentSetup": "/home/shaalekh/esp/v5.5.2/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
