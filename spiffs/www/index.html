@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PhysoKit Data Vault</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="backdrop"></div>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">PhysoKit</span>
+      <span class="tag">On-device signal logs</span>
+    </div>
+    <div class="chip">AP mode</div>
+  </header>
+
+  <main class="shell">
+    <section class="hero">
+      <h1>Data Vault</h1>
+      <p>Manage CSV acquisitions stored on your PhysoKit device.</p>
+      <div class="hero-actions">
+        <button id="refreshBtn" class="btn">Refresh list</button>
+        <button id="deleteBtn" class="btn danger" disabled>Delete selected</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Saved runs</h2>
+          <p>Download or remove files to free storage.</p>
+        </div>
+        <div class="panel-meta">
+          <label class="select-all">
+            <input type="checkbox" id="selectAll">
+            <span>Select all</span>
+          </label>
+          <span id="selectionCount" class="muted">0 selected</span>
+        </div>
+      </div>
+
+      <div class="table">
+        <div class="table-head">
+          <div></div>
+          <div>File</div>
+          <div class="right">Size</div>
+          <div class="right">Action</div>
+        </div>
+        <div id="fileList" class="table-body"></div>
+      </div>
+
+      <div id="emptyState" class="empty hidden">
+        <h3>No CSV files yet</h3>
+        <p>Start an acquisition to generate your first log.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">PhysoKit local storage</footer>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

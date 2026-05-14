@@ -1,0 +1,46 @@
+OLED USAGE IN THIS PROJECT (S3_i2c_scanner)
+
+1) Hardware and bus configuration
+- I2C master port: I2C_NUM_0
+- SDA: GPIO 8, SCL: GPIO 9
+- Bus speed: 400 kHz
+- Internal pullups enabled; glitch ignore count = 7
+- OLED 7-bit address: 0x3C
+- OLED module: 0.49 inch, 64x32, SSD1315-compatible controller
+- I2C bus is shared with ADS1115 (0x48). A mutex serializes access.
+
+2) Display geometry and buffer layout
+- Logical resolution used: 64x32 pixels
+- Full framebuffer mode via u8g2 "_f" setup
+- Buffer size: 64 * 32 / 8 = 256 bytes (inside u8g2)
+- The 64x32 display uses the 32-line multiplex ratio (0x1F)
+
+3) Initialization path (u8g2)
+- Setup call: u8g2_Setup_ssd1306_i2c_64x32_1f_f()
+  - The "1f" variant sets the multiplex ratio to 0x1F for true 32-line panels.
+  - This avoids top/bottom split artifacts on SSD1315-based 64x32 modules.
+- I2C address is set with u8x8_SetI2CAddress(&s_u8g2.u8x8, 0x3C << 1)
+- Display init and power enable:
+  u8g2_InitDisplay(), u8g2_SetPowerSave(&s_u8g2, 0)
+- Font: u8g2_font_5x7_tr
+
+4) Rendering model (UI)
+- The UI task clears the buffer each frame and redraws the screen:
+  u8g2_ClearBuffer() -> draw -> u8g2_SendBuffer()
+- Menu states show centered text lines:
+  "Acquisition"/"mode", "Web server"/"mode", "Saved as" + filename
+- Acquisition state shows a mm:ss timer and a moving heartline graph
+- Web state shows "IP addr:" and the soft-AP IP
+
+5) Update loop behavior
+- ui_task refreshes the screen every 50 ms (UI_REFRESH_MS)
+- I2C access is serialized by s_i2c_mutex inside u8x8_byte_esp32_i2c()
+- The u8x8 I2C handler batches bytes and transmits on END_TRANSFER
+
+6) Data sources for the display
+- Button inputs select UI states (NAV_BUTTON_GPIO and SELECT_BUTTON_GPIO)
+- Acquisition timer uses esp_timer
+- Temperature (DS18B20) is used for logging but is not rendered on the OLED
+
+Relevant code is in main/main.c (functions: ui_task, ui_draw_centered,
+ui_draw_heartline, app_main, u8x8_byte_esp32_i2c).

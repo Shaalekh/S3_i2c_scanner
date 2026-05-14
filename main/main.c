@@ -3,6 +3,9 @@
 #include <string.h>
 #include <math.h>
 #include <dirent.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -35,9 +38,16 @@
 #define DS18B20_GPIO 10
 #define NAV_BUTTON_GPIO 13
 #define SELECT_BUTTON_GPIO 14
+#define AD8232_LO_MINUS_GPIO 2
+#define AD8232_LO_PLUS_GPIO 4
+#define AD8232_STNDBY_GPIO 5
 
 #define OLED_WIDTH 64
 #define OLED_HEIGHT 32
+
+#define WEB_ROOT "/spiffs/www"
+#define MAX_DELETE_BODY_LEN 2048
+#define MAX_FILE_NAME_LEN 64
 
 #define DS18B20_CMD_SKIP_ROM 0xCC
 #define DS18B20_CMD_CONVERT_T 0x44
@@ -216,6 +226,12 @@ static bool button_pressed(gpio_num_t gpio)
 	return gpio_get_level(gpio) == 0;
 }
 
+static void ad8232_set_standby(bool standby)
+{
+	/* AD8232 standby is active-low. */
+	gpio_set_level(AD8232_STNDBY_GPIO, standby ? 0 : 1);
+}
+
 static const char *basename_ptr(const char *path)
 {
 	const char *slash = strrchr(path, '/');
@@ -257,6 +273,7 @@ static bool start_acquisition(void)
 		xSemaphoreGive(s_acq_mutex);
 	}
 	s_acq_start_ms = (uint64_t)(esp_timer_get_time() / 1000);
+	ad8232_set_standby(false);
 	s_acq_running = true;
 	ESP_LOGI(TAG_UI, "Acquisition started: %s", s_log_path);
 	return true;
@@ -264,6 +281,7 @@ static bool start_acquisition(void)
 
 static void stop_acquisition(void)
 {
+	ad8232_set_standby(true);
 	s_acq_running = false;
 	if (xSemaphoreTake(s_acq_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
 		if (s_log_file != NULL) {
@@ -278,12 +296,99 @@ static void stop_acquisition(void)
 	ESP_LOGI(TAG_UI, "Acquisition stopped, saved %s", s_saved_name);
 }
 
-static esp_err_t http_root_get_handler(httpd_req_t *req)
-{
-	httpd_resp_set_type(req, "text/html");
-	httpd_resp_sendstr_chunk(req, "<html><head><title>PhysoKit Files</title></head><body>");
-	httpd_resp_sendstr_chunk(req, "<h3>CSV Files</h3><ul>");
+typedef struct {
+	const char *path;
+	const char *content_type;
+} static_file_t;
 
+static bool has_suffix(const char *value, const char *suffix)
+{
+	size_t value_len = strlen(value);
+	size_t suffix_len = strlen(suffix);
+	if (value_len < suffix_len) {
+		return false;
+	}
+	return strcmp(value + (value_len - suffix_len), suffix) == 0;
+}
+
+static bool is_safe_csv_name(const char *name)
+{
+	if (name == NULL || name[0] == '\0') {
+		return false;
+	}
+	if (strstr(name, "..") != NULL || strchr(name, '/') != NULL || strchr(name, '\\') != NULL) {
+		return false;
+	}
+	return has_suffix(name, ".csv");
+}
+
+static esp_err_t http_send_file(httpd_req_t *req, const char *path, const char *content_type)
+{
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+		return ESP_FAIL;
+	}
+
+	httpd_resp_set_type(req, content_type);
+
+	char buf[256];
+	size_t read_bytes;
+	while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
+		if (httpd_resp_send_chunk(req, buf, read_bytes) != ESP_OK) {
+			fclose(f);
+			httpd_resp_sendstr_chunk(req, NULL);
+			return ESP_FAIL;
+		}
+	}
+	fclose(f);
+	httpd_resp_send_chunk(req, NULL, 0);
+	return ESP_OK;
+}
+
+static void json_write_escaped(httpd_req_t *req, const char *text)
+{
+	for (const char *p = text; *p != '\0'; p++) {
+		unsigned char ch = (unsigned char)*p;
+		if (ch == '"' || ch == '\\') {
+			char esc[3] = {'\\', (char)ch, '\0'};
+			httpd_resp_sendstr_chunk(req, esc);
+		} else if (ch < 0x20) {
+			char esc[7];
+			snprintf(esc, sizeof(esc), "\\u%04x", ch);
+			httpd_resp_sendstr_chunk(req, esc);
+		} else {
+			char out[2] = {(char)ch, '\0'};
+			httpd_resp_sendstr_chunk(req, out);
+		}
+	}
+}
+
+static bool delete_csv_file(const char *name)
+{
+	if (!is_safe_csv_name(name)) {
+		return false;
+	}
+	char path[96];
+	snprintf(path, sizeof(path), "/spiffs/%s", name);
+	return unlink(path) == 0;
+}
+
+static esp_err_t http_static_get_handler(httpd_req_t *req)
+{
+	const static_file_t *asset = (const static_file_t *)req->user_ctx;
+	if (asset == NULL) {
+		return ESP_FAIL;
+	}
+	return http_send_file(req, asset->path, asset->content_type);
+}
+
+static esp_err_t http_api_files_get_handler(httpd_req_t *req)
+{
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_sendstr_chunk(req, "{\"files\":[");
+
+	bool first = true;
 	DIR *dir = opendir("/spiffs");
 	if (dir != NULL) {
 		struct dirent *ent;
@@ -291,17 +396,127 @@ static esp_err_t http_root_get_handler(httpd_req_t *req)
 			if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
 				continue;
 			}
-			httpd_resp_sendstr_chunk(req, "<li><a href=\"/download?name=");
-			httpd_resp_sendstr_chunk(req, ent->d_name);
-			httpd_resp_sendstr_chunk(req, "\">");
-			httpd_resp_sendstr_chunk(req, ent->d_name);
-			httpd_resp_sendstr_chunk(req, "</a></li>");
+			if (!has_suffix(ent->d_name, ".csv")) {
+				continue;
+			}
+
+			char path[96];
+			size_t base_len = strlen("/spiffs/");
+			size_t name_len = strlen(ent->d_name);
+			if (base_len + name_len >= sizeof(path)) {
+				continue;
+			}
+			memcpy(path, "/spiffs/", base_len);
+			memcpy(path + base_len, ent->d_name, name_len + 1);
+			struct stat st;
+			if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+				continue;
+			}
+
+			if (!first) {
+				httpd_resp_sendstr_chunk(req, ",");
+			}
+			httpd_resp_sendstr_chunk(req, "{\"name\":\"");
+			json_write_escaped(req, ent->d_name);
+			char size_buf[48];
+			snprintf(size_buf, sizeof(size_buf), "\",\"size\":%ld}", (long)st.st_size);
+			httpd_resp_sendstr_chunk(req, size_buf);
+			first = false;
 		}
 		closedir(dir);
 	}
 
-	httpd_resp_sendstr_chunk(req, "</ul></body></html>");
-	httpd_resp_send_chunk(req, NULL, 0);
+	httpd_resp_sendstr_chunk(req, "]}");
+	httpd_resp_sendstr_chunk(req, NULL);
+	return ESP_OK;
+}
+
+static esp_err_t http_api_delete_post_handler(httpd_req_t *req)
+{
+	if (req->content_len <= 0) {
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+		return ESP_FAIL;
+	}
+	if (req->content_len > MAX_DELETE_BODY_LEN) {
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+		return ESP_FAIL;
+	}
+
+	char *body = malloc((size_t)req->content_len + 1U);
+	if (body == NULL) {
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
+		return ESP_FAIL;
+	}
+
+	int received = 0;
+	while (received < req->content_len) {
+		int r = httpd_req_recv(req, body + received, req->content_len - received);
+		if (r < 0) {
+			if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+				continue;
+			}
+			free(body);
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Recv failed");
+			return ESP_FAIL;
+		}
+		received += r;
+	}
+	body[received] = '\0';
+
+	int deleted = 0;
+	int failed = 0;
+	bool in_string = false;
+	bool escaped = false;
+	char name[MAX_FILE_NAME_LEN];
+	size_t name_len = 0;
+
+	for (int i = 0; i < received; i++) {
+		char ch = body[i];
+		if (!in_string) {
+			if (ch == '"') {
+				in_string = true;
+				escaped = false;
+				name_len = 0;
+			}
+			continue;
+		}
+
+		if (escaped) {
+			if (name_len + 1 < sizeof(name)) {
+				name[name_len++] = ch;
+			}
+			escaped = false;
+			continue;
+		}
+
+		if (ch == '\\') {
+			escaped = true;
+			continue;
+		}
+
+		if (ch == '"') {
+			name[name_len] = '\0';
+			in_string = false;
+			if (is_safe_csv_name(name)) {
+				if (delete_csv_file(name)) {
+					deleted++;
+				} else {
+					failed++;
+				}
+			}
+			continue;
+		}
+
+		if (name_len + 1 < sizeof(name)) {
+			name[name_len++] = ch;
+		}
+	}
+
+	free(body);
+	httpd_resp_set_type(req, "application/json");
+	char out[64];
+	snprintf(out, sizeof(out), "{\"deleted\":%d,\"failed\":%d}", deleted, failed);
+	httpd_resp_sendstr(req, out);
 	return ESP_OK;
 }
 
@@ -317,7 +532,7 @@ static esp_err_t http_download_get_handler(httpd_req_t *req)
 		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing name");
 		return ESP_FAIL;
 	}
-	if (strstr(name, "..") != NULL || strchr(name, '/') != NULL) {
+	if (!is_safe_csv_name(name)) {
 		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid name");
 		return ESP_FAIL;
 	}
@@ -361,10 +576,44 @@ static esp_err_t http_server_start(void)
 		return ESP_FAIL;
 	}
 
+	static const static_file_t index_asset = {WEB_ROOT "/index.html", "text/html"};
+	static const static_file_t css_asset = {WEB_ROOT "/styles.css", "text/css"};
+	static const static_file_t js_asset = {WEB_ROOT "/app.js", "application/javascript"};
+
 	static const httpd_uri_t root_uri = {
 		.uri = "/",
 		.method = HTTP_GET,
-		.handler = http_root_get_handler,
+		.handler = http_static_get_handler,
+		.user_ctx = (void *)&index_asset,
+	};
+	static const httpd_uri_t index_uri = {
+		.uri = "/index.html",
+		.method = HTTP_GET,
+		.handler = http_static_get_handler,
+		.user_ctx = (void *)&index_asset,
+	};
+	static const httpd_uri_t css_uri = {
+		.uri = "/styles.css",
+		.method = HTTP_GET,
+		.handler = http_static_get_handler,
+		.user_ctx = (void *)&css_asset,
+	};
+	static const httpd_uri_t js_uri = {
+		.uri = "/app.js",
+		.method = HTTP_GET,
+		.handler = http_static_get_handler,
+		.user_ctx = (void *)&js_asset,
+	};
+	static const httpd_uri_t api_files_uri = {
+		.uri = "/api/files",
+		.method = HTTP_GET,
+		.handler = http_api_files_get_handler,
+		.user_ctx = NULL,
+	};
+	static const httpd_uri_t api_delete_uri = {
+		.uri = "/api/delete",
+		.method = HTTP_POST,
+		.handler = http_api_delete_post_handler,
 		.user_ctx = NULL,
 	};
 	static const httpd_uri_t download_uri = {
@@ -373,7 +622,13 @@ static esp_err_t http_server_start(void)
 		.handler = http_download_get_handler,
 		.user_ctx = NULL,
 	};
+
 	httpd_register_uri_handler(s_http, &root_uri);
+	httpd_register_uri_handler(s_http, &index_uri);
+	httpd_register_uri_handler(s_http, &css_uri);
+	httpd_register_uri_handler(s_http, &js_uri);
+	httpd_register_uri_handler(s_http, &api_files_uri);
+	httpd_register_uri_handler(s_http, &api_delete_uri);
 	httpd_register_uri_handler(s_http, &download_uri);
 	return ESP_OK;
 }
@@ -765,6 +1020,25 @@ void app_main(void)
 	};
 	ESP_ERROR_CHECK(gpio_config(&button_gpio));
 
+	gpio_config_t ad8232_lo_gpio = {
+		.pin_bit_mask = (1ULL << AD8232_LO_MINUS_GPIO) | (1ULL << AD8232_LO_PLUS_GPIO),
+		.mode = GPIO_MODE_INPUT,
+		.pull_up_en = GPIO_PULLUP_ENABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	ESP_ERROR_CHECK(gpio_config(&ad8232_lo_gpio));
+
+	gpio_config_t ad8232_standby_gpio = {
+		.pin_bit_mask = 1ULL << AD8232_STNDBY_GPIO,
+		.mode = GPIO_MODE_OUTPUT,
+		.pull_up_en = GPIO_PULLUP_DISABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	ESP_ERROR_CHECK(gpio_config(&ad8232_standby_gpio));
+	ad8232_set_standby(true);
+
 	i2c_master_bus_config_t bus_config = {
 		.clk_source = I2C_CLK_SRC_DEFAULT,
 		.i2c_port = I2C_PORT,
@@ -798,7 +1072,7 @@ void app_main(void)
 		ESP_LOGW(TAG_UI, "Data logger (SPIFFS) init failed");
 	}
 
-	u8g2_Setup_ssd1306_i2c_64x32_noname_f(
+	u8g2_Setup_ssd1306_i2c_64x32_1f_f(
 		&s_u8g2, U8G2_R0, u8x8_byte_esp32_i2c, u8x8_gpio_and_delay_esp32);
 	u8x8_SetI2CAddress(&s_u8g2.u8x8, OLED_I2C_ADDR << 1);
 	u8g2_InitDisplay(&s_u8g2);
